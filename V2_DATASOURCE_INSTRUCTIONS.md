@@ -1,0 +1,3 @@
+# V2 Datasource Instructions
+
+Canonical source missing: com_subjective_architecture_docs/architecture/27_v2_datasource_authoring_instructions.md

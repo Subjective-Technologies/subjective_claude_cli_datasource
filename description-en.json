@@ -1,0 +1,72 @@
+{
+  "description": "Resumable Anthropic Claude Code CLI connector that reuses existing CLI authentication, preserves native session IDs, and returns structured print-mode JSON.",
+  "domainCategory": "AI & Automation",
+  "subjectiveTechnologyElement": "DataSources",
+  "publisher": "BrainBoost Ltd.",
+  "publisher_website": "https://subjectivetechnologies.com",
+  "publisher_email": "plugins@subjectivetechnologies.com",
+  "disclaimer": "This VirtualGlass extension is not associated with, endorsed by, or approved by Anthropic. It may use Claude Code CLI for convenience and is provided free to use. BrainBoost Ltd. is not responsible for any damages, losses, or issues resulting from its use.",
+  "sections": [
+    {
+      "type": "splitList",
+      "title": "Claude CLI",
+      "text": "Resumable Anthropic Claude Code CLI connector using provider-owned authentication and native conversation sessions.",
+      "image": {
+        "src": "/subjective_claude_cli_datasource/icon.svg",
+        "alt": "Claude CLI icon"
+      },
+      "list": [
+        "Connection type: ON_DEMAND",
+        "Config fields: authentication, optional API key, model, permission mode, workspace, session, timeout, max turns, allowed tools, and system prompt",
+        "Output: Structured response, native session ID, Claude events, usage, status, and errors."
+      ]
+    },
+    {
+      "type": "example",
+      "title": "Typical workflow",
+      "intro": "Configure Claude CLI with the connection fields and run it as part of a BrainBoost pipeline.",
+      "cards": [
+        {
+          "title": "Connect",
+          "text": "Reuse an existing Claude CLI login by default. Configure workspace and permission mode, then optionally select a model or existing session ID."
+        },
+        {
+          "title": "Fetch",
+          "text": "Start datasource and send chat messages. First turn creates a native Claude session; later turns resume it."
+        },
+        {
+          "title": "Consume",
+          "text": "Consume normalized response, session ID, native events, usage, and error status from chat UI or downstream automation."
+        }
+      ]
+    },
+    {
+      "type": "faq",
+      "title": "FAQ",
+      "items": [
+        {
+          "q": "What do I need to configure?",
+          "a": "Claude Code CLI must be installed and logged in. Existing-session authentication requires no API key. Workspace defaults to datasource process directory and permission mode defaults to default."
+        },
+        {
+          "q": "What does it output?",
+          "a": "Returns structured status, response text, native Claude session ID, events, usage, and errors."
+        },
+        {
+          "q": "Where does the data go?",
+          "a": "Outputs are emitted to downstream subscribers in the BrainBoost pipeline. Some datasources also write artifacts (context files, catalogs, or exports) locally based on your configuration."
+        }
+      ]
+    },
+    {
+      "type": "finalCta",
+      "title": "Ready to use Claude CLI?",
+      "text": "Add it to your BrainBoost pipeline and start ingesting.",
+      "primaryCta": {
+        "label": "Get Subjective Client",
+        "href": "/subjective-client-download"
+      },
+      "subtext": "Run this datasource locally with your own credentials and storage."
+    }
+  ]
+}
