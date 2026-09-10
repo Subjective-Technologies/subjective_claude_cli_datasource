@@ -150,6 +150,21 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertEqual(command[-1], "continue")
 
+    def test_prompt_is_separate_from_variadic_options(self):
+        # Claude declares --add-dir and --allowedTools as variadic options. Without
+        # an option terminator, they consume the prompt as another option value.
+        for settings, directories in [
+            ({}, ["/tmp/attachments"]),
+            ({"allowed_tools": "Read,Bash"}, []),
+            ({"allowed_tools": "Read"}, ["/tmp/one", "/tmp/two"]),
+            ({}, []),
+        ]:
+            with self.subTest(settings=settings, directories=directories):
+                command = self.datasource(**settings)._build_command(
+                    "--this is the user prompt", extra_dirs=directories
+                )
+                self.assertEqual(command[-2:], ["--", "--this is the user prompt"])
+
     def test_parser_supports_print_mode_json(self):
         output = result_json(
             result="Done.",

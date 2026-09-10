@@ -493,7 +493,9 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
         for directory in extra_dirs or []:
             command.extend(["--add-dir", directory])
 
-        command.append(message)
+        # Variadic options (--add-dir, --allowedTools) otherwise consume the prompt.
+        # The terminator also preserves prompts beginning with a dash.
+        command.extend(["--", message])
         return command
 
     def _parse_cli_output(self, output: str) -> dict:
