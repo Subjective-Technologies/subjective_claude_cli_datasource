@@ -351,3 +351,39 @@ class SubjectiveClaudeCliLiveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NormalizeMessageAttachmentsTests(unittest.TestCase):
+    """run() hands the whole request in as the message *and* passes request["files"]
+    again as `files`, so an attachment reached the CLI twice — wasting context and
+    confusing vision models ("same image arrived twice")."""
+
+    def setUp(self):
+        self.source = SubjectiveClaudeCliDataSource(connection={}, config={})
+
+    def _image(self, name="shot.png"):
+        return {"filename": name, "mime_type": "image/png", "content": "aGVsbG8="}
+
+    def test_an_attachment_passed_both_ways_is_sent_once(self):
+        image = self._image()
+        request = {"action": "send", "prompt": "what is this", "files": [image]}
+        payload = dict(request)
+        payload["content"] = request["prompt"]
+
+        normalized = self.source._normalize_message(payload, files=request["files"])
+
+        self.assertEqual(normalized["files"], [image])
+
+    def test_files_and_attachments_keys_holding_the_same_image_collapse(self):
+        image = self._image()
+        normalized = self.source._normalize_message(
+            {"content": "hi", "files": [image], "attachments": [dict(image)]}, files=None
+        )
+        self.assertEqual(normalized["files"], [image])
+
+    def test_genuinely_different_attachments_are_all_kept_in_order(self):
+        first, second = self._image("a.png"), self._image("b.png")
+        normalized = self.source._normalize_message(
+            {"content": "hi", "files": [first]}, files=[second]
+        )
+        self.assertEqual(normalized["files"], [first, second])

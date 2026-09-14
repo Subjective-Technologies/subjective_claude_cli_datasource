@@ -725,9 +725,19 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
         else:
             prompt = str(message or "")
 
-        all_files = list(embedded_files)
-        if isinstance(files, list):
-            all_files.extend(files)
+        # Deduplicate. run() puts the whole request in `message` *and* passes
+        # request["files"] again as `files`, so every attachment arrived twice — the
+        # "same image arrived twice" reports. A payload carrying both "files" and
+        # "attachments" doubles them the same way. Dedupe on content rather than
+        # identity: the two copies are equal dicts, not the same object.
+        all_files = []
+        seen: set[str] = set()
+        for item in [*embedded_files, *(files if isinstance(files, list) else [])]:
+            fingerprint = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else repr(item)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            all_files.append(item)
         return {
             "prompt": prompt,
             "files": all_files,
