@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -41,6 +42,12 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         connection = self._connection or {}
+
+        # In-flight turn, for cancel(). A fresh instance is built per turn (see
+        # datasources.run), so this is one process at a time, not a registry.
+        self._active_process: subprocess.Popen | None = None
+        self._cancelled = False
+        self._process_lock = threading.Lock()
 
         auth_method = str(connection.get("auth_method") or self.AUTH_EXISTING_SESSION)
         # Older saved connections may have called CLI OAuth mode simply "oauth".
@@ -377,22 +384,77 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
                 result["session_id"] = self.session_id or ""
             return result
 
+    def cancel(self) -> bool:
+        """Stop the CLI child of an in-flight turn. Called from another thread.
+
+        Returns True if a running process was signalled. Also latches, so a cancel that
+        arrives in the gap between handle_message() and the spawn still takes effect
+        instead of being silently lost.
+        """
+        with self._process_lock:
+            self._cancelled = True
+            process = self._active_process
+        if process is None or process.poll() is not None:
+            return False
+        BBLogger.log("[SubjectiveClaudeCliDataSource] Cancelling Claude turn")
+        self._signal_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._signal_group(process, signal.SIGKILL)
+        return True
+
+    @staticmethod
+    def _signal_group(process: subprocess.Popen, sig: int) -> None:
+        """Signal the whole process group.
+
+        The CLI spawns its own children; signalling only the direct child leaves those
+        orphaned, still running and still holding the session. The turn is started with
+        start_new_session=True precisely so the group can be taken down as a unit.
+        """
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill() if sig == signal.SIGKILL else process.terminate()
+            except OSError:
+                pass
+
     def _execute_command(self, command: list[str]) -> dict:
         try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                env=self._build_environment(),
-                cwd=self._valid_working_directory(),
-            )
-        except subprocess.TimeoutExpired:
-            BBLogger.log(
-                f"[SubjectiveClaudeCliDataSource] Claude turn timed out after {self.timeout}s"
-            )
-            return self._error_result(
-                "timeout", f"Claude execution timed out after {self.timeout} seconds."
+            with self._process_lock:
+                if self._cancelled:
+                    return self._error_result("cancelled", "Stopped before Claude started.")
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=self._build_environment(),
+                    cwd=self._valid_working_directory(),
+                    # Own process group, so cancel() can take the CLI and everything it
+                    # spawned down together.
+                    start_new_session=True,
+                )
+                self._active_process = process
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                self._signal_group(process, signal.SIGKILL)
+                stdout, stderr = process.communicate()
+                BBLogger.log(
+                    f"[SubjectiveClaudeCliDataSource] Claude turn timed out after {self.timeout}s"
+                )
+                return self._error_result(
+                    "timeout", f"Claude execution timed out after {self.timeout} seconds."
+                )
+            finally:
+                with self._process_lock:
+                    self._active_process = None
+            if self._cancelled:
+                return self._error_result("cancelled", "Stopped by the operator.")
+            completed = subprocess.CompletedProcess(
+                command, process.returncode, stdout or "", stderr or ""
             )
         except OSError as exc:
             BBLogger.log(f"[SubjectiveClaudeCliDataSource] Failed to start Claude: {exc}")

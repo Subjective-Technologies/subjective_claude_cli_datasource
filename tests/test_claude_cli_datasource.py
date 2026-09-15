@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import subprocess
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +11,50 @@ from SubjectiveClaudeCliDataSource import SubjectiveClaudeCliDataSource
 
 def completed(command, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+class FakePopen:
+    """Stands in for the CLI child.
+
+    The turn path drives a Popen rather than subprocess.run so that cancel() can take
+    the CLI's whole process group down mid-turn; these tests patch that instead.
+    """
+
+    def __init__(self, stdout="", stderr="", returncode=0, timeout=False, hangs=False):
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = returncode
+        self._timeout = timeout
+        self._hangs = hangs
+        self.pid = 4242
+        self.started = threading.Event()
+        self.released = threading.Event()
+        self.signalled = []
+
+    def communicate(self, timeout=None):
+        if self._timeout:
+            self._timeout = False
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+        if self._hangs:
+            # Mimic a turn still running: block until cancel() releases it.
+            self.started.set()
+            self.released.wait(timeout=10)
+        return self._stdout, self._stderr
+
+    def poll(self):
+        return None if (self._hangs and not self.released.is_set()) else self.returncode
+
+    def wait(self, timeout=None):
+        self.released.set()
+        return self.returncode
+
+    def kill(self):
+        self.signalled.append("kill")
+        self.released.set()
+
+    def terminate(self):
+        self.signalled.append("terminate")
+        self.released.set()
 
 
 def result_json(
@@ -216,13 +261,13 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertEqual(parsed["usage"]["total_cost_usd"], 0.02)
         self.assertEqual(len(parsed["events"]), 3)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
     def test_second_message_resumes_session_created_by_first(self, run):
         instance = self.datasource()
         self.ready(instance)
         run.side_effect = [
-            completed([], stdout=result_json(result="First", session_id="session-123")),
-            completed([], stdout=result_json(result="Second", session_id="session-123")),
+            FakePopen(stdout=result_json(result="First", session_id="session-123")),
+            FakePopen(stdout=result_json(result="Second", session_id="session-123")),
         ]
 
         first = instance.handle_message("hello")
@@ -235,12 +280,12 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertIn("--resume", second_command)
         self.assertIn("session-123", second_command)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
     def test_explicit_new_session_does_not_resume(self, run):
         instance = self.datasource(session_id="old-session")
         self.ready(instance)
-        run.return_value = completed(
-            [], stdout=result_json(result="New", session_id="new-session")
+        run.return_value = FakePopen(
+            stdout=result_json(result="New", session_id="new-session")
         )
 
         result = instance.handle_message({"content": "start", "new_session": True})
@@ -250,11 +295,11 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertNotIn("--resume", command)
         self.assertNotIn("old-session", command)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
     def test_cli_error_is_structured_and_keeps_session(self, run):
         instance = self.datasource(session_id="session-123")
         self.ready(instance)
-        run.return_value = completed([], returncode=1, stderr="session not found")
+        run.return_value = FakePopen(returncode=1, stderr="session not found")
 
         result = instance.handle_message("continue")
 
@@ -263,11 +308,11 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertEqual(result["session_id"], "session-123")
         self.assertEqual(result["exit_code"], 1)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
     def test_timeout_is_structured(self, run):
         instance = self.datasource(timeout=10)
         self.ready(instance)
-        run.side_effect = subprocess.TimeoutExpired(["claude"], timeout=10)
+        run.return_value = FakePopen(timeout=True)
 
         result = instance.handle_message("hello")
 
@@ -294,14 +339,13 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(prepared["file_paths"][0]))
             self.assertTrue(prepared["extra_dirs"])
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
     def test_request_can_select_workspace_and_permission_mode(self, run):
         instance = self.datasource(
             working_directory="/tmp", permission_mode="default"
         )
         self.ready(instance)
-        run.return_value = completed(
-            [],
+        run.return_value = FakePopen(
             stdout=result_json(result="Ready", session_id="session-workspace"),
         )
         result = instance.handle_message(
