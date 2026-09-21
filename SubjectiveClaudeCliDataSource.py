@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from brainboost_data_source_logger_package.BBLogger import BBLogger
-from subjective_abstract_data_source_package import SubjectiveDataSource
+from subjective_abstract_data_source_package import SubjectiveDataSource, runner_from
 
 
 class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
@@ -78,6 +78,10 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
         self.session_id = str(connection.get("session_id") or "") or None
 
         self._claude_path: str | None = None
+        # Where this turn's process runs. A LocalRunner unless the connection
+        # carries one, which is how an SSH-backed chat has the CLI execute on
+        # another machine without a line of SSH code in this file.
+        self._runner = runner_from(connection)
         self._lock = threading.RLock()
 
     @classmethod
@@ -278,11 +282,11 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
             return self._status_result("ready", version=version)
 
         try:
-            completed = subprocess.run(
+            # Through the runner: the credentials that matter are the ones on the
+            # machine the CLI will actually run on.
+            completed = self._runner.run(
                 [claude_path, "auth", "status", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+                timeout=30 if self._runner.is_remote else 10,
                 env=self._build_environment(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -425,16 +429,10 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
             with self._process_lock:
                 if self._cancelled:
                     return self._error_result("cancelled", "Stopped before Claude started.")
-                process = subprocess.Popen(
+                process = self._runner.popen(
                     command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
                     env=self._build_environment(),
-                    cwd=self._valid_working_directory(),
-                    # Own process group, so cancel() can take the CLI and everything it
-                    # spawned down together.
-                    start_new_session=True,
+                    cwd=self._valid_working_directory() or "",
                 )
                 self._active_process = process
             try:
@@ -830,8 +828,29 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
                     if parent and parent not in extra_dirs:
                         extra_dirs.append(parent)
 
+            # A file staged here is on the machine running the service. When the
+            # CLI runs elsewhere it cannot open any of them, so each is copied
+            # across and the path the agent is given is the one on its own side.
+            if file_paths and self._runner.is_remote:
+                remote_paths: list[str] = []
+                extra_dirs = []
+                for path in file_paths:
+                    try:
+                        remote = self._runner.upload(path)
+                    except OSError as error:
+                        BBLogger.log(
+                            f"[SubjectiveClaudeCliDataSource] Could not send attachment "
+                            f"{os.path.basename(path)}: {error}"
+                        )
+                        continue
+                    remote_paths.append(remote)
+                    parent = os.path.dirname(remote)
+                    if parent and parent not in extra_dirs:
+                        extra_dirs.append(parent)
+                file_paths = remote_paths
+
             # Always grant tool access to the temp attachment directory when used.
-            if file_paths and temp_dir not in extra_dirs:
+            if file_paths and not self._runner.is_remote and temp_dir not in extra_dirs:
                 extra_dirs.append(temp_dir)
             yield {
                 "text_blocks": text_blocks,
@@ -958,32 +977,26 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
             )
         return "\n\n".join(sections)
 
+    #: Where Claude Code installs. Tried as absolute paths before PATH, because a
+    #: non-interactive shell often has none of these on it.
+    CLI_CANDIDATES = (
+        "~/.local/bin/claude",
+        "~/bin/claude",
+        "/usr/local/bin/claude",
+        "~/.npm-global/bin/claude",
+        "~/AppData/Local/Programs/claude/claude.exe",
+        "~/AppData/Roaming/npm/claude.cmd",
+    )
+
     def _find_claude_cli(self) -> str | None:
         if self._claude_path:
             return self._claude_path
-
-        candidates: list[str] = []
-        if self.configured_claude_path:
-            candidates.append(os.path.expanduser(self.configured_claude_path))
-        path_candidate = shutil.which("claude")
-        if path_candidate:
-            candidates.append(path_candidate)
-        candidates.extend(
-            [
-                os.path.expanduser("~/.local/bin/claude"),
-                os.path.expanduser("~/bin/claude"),
-                "/usr/local/bin/claude",
-                os.path.expanduser("~/.npm-global/bin/claude"),
-                os.path.expanduser("~/AppData/Local/Programs/claude/claude.exe"),
-                os.path.expanduser("~/AppData/Roaming/npm/claude.cmd"),
-            ]
+        candidates = tuple(
+            path for path in (self.configured_claude_path, *self.CLI_CANDIDATES) if path
         )
-
-        for candidate in candidates:
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                self._claude_path = os.path.abspath(candidate)
-                return self._claude_path
-        return None
+        # The runner decides which machine is searched.
+        self._claude_path = self._runner.which("claude", candidates)
+        return self._claude_path
 
     def _build_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -992,9 +1005,14 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
         return environment
 
     def _valid_working_directory(self) -> str | None:
-        if self.working_directory and os.path.isdir(self.working_directory):
+        if not self.working_directory:
+            return None
+        # A remote path cannot be checked with os.path.isdir, and checking the
+        # local filesystem would reject every valid remote directory. The runner
+        # passes it through and the remote shell reports a bad one itself.
+        if self._runner.is_remote:
             return self.working_directory
-        return None
+        return self.working_directory if os.path.isdir(self.working_directory) else None
 
     @staticmethod
     def _combined_output(completed: subprocess.CompletedProcess) -> str:
@@ -1006,11 +1024,9 @@ class SubjectiveClaudeCliDataSource(SubjectiveDataSource):
 
     def _command_text(self, command: list[str], timeout: int) -> str:
         try:
-            completed = subprocess.run(
+            completed = self._runner.run(
                 command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                timeout=timeout * 3 if self._runner.is_remote else timeout,
                 env=self._build_environment(),
             )
         except (OSError, subprocess.SubprocessError):
