@@ -2,9 +2,24 @@ import base64
 import json
 import os
 import subprocess
+import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
+
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+_SERVICE_ROOT = _PLUGIN_ROOT.parents[1]
+for _entry in (
+    _PLUGIN_ROOT,
+    _SERVICE_ROOT / "libs" / "dependencies" / "subjective-abstract-data-source-package",
+    _SERVICE_ROOT / "libs" / "dependencies" / "brainboost_data_source_logger_package",
+    _SERVICE_ROOT / "libs" / "dependencies" / "brainboost_configuration_package",
+):
+    _text = str(_entry)
+    if _entry.is_dir() and _text not in sys.path:
+        sys.path.insert(0, _text)
 
 from SubjectiveClaudeCliDataSource import SubjectiveClaudeCliDataSource
 
@@ -110,7 +125,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertIn("session_id", instance.output_schema())
         self.assertIn("auth_method", instance.connection_schema())
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.run")
     def test_status_reuses_existing_cli_login_without_starting_login(self, run):
         run.side_effect = [
             completed([], stdout="2.1.178 (Claude Code)\n"),
@@ -135,7 +150,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertIn(["/usr/bin/claude", "auth", "status", "--json"], commands)
         self.assertFalse(any("login" in command for command in commands))
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.run")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.run")
     def test_status_reports_login_required(self, run):
         run.side_effect = [
             completed([], stdout="2.1.178 (Claude Code)\n"),
@@ -261,7 +276,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertEqual(parsed["usage"]["total_cost_usd"], 0.02)
         self.assertEqual(len(parsed["events"]), 3)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
     def test_second_message_resumes_session_created_by_first(self, run):
         instance = self.datasource()
         self.ready(instance)
@@ -280,7 +295,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertIn("--resume", second_command)
         self.assertIn("session-123", second_command)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
     def test_explicit_new_session_does_not_resume(self, run):
         instance = self.datasource(session_id="old-session")
         self.ready(instance)
@@ -295,7 +310,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertNotIn("--resume", command)
         self.assertNotIn("old-session", command)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
     def test_cli_error_is_structured_and_keeps_session(self, run):
         instance = self.datasource(session_id="session-123")
         self.ready(instance)
@@ -308,7 +323,7 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
         self.assertEqual(result["session_id"], "session-123")
         self.assertEqual(result["exit_code"], 1)
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
     def test_timeout_is_structured(self, run):
         instance = self.datasource(timeout=10)
         self.ready(instance)
@@ -339,7 +354,111 @@ class SubjectiveClaudeCliDataSourceTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(prepared["file_paths"][0]))
             self.assertTrue(prepared["extra_dirs"])
 
-    @patch("SubjectiveClaudeCliDataSource.subprocess.Popen")
+    def _dashboard_file(self, filename: str, mime_type: str, raw: bytes) -> dict:
+        return {
+            "filename": filename,
+            "mime_type": mime_type,
+            "content": base64.b64encode(raw).decode("ascii"),
+        }
+
+    def _drive(self, popen, files, content="Review these"):
+        """handle_message with the subprocess patched. Reads staged files before the temp dir dies."""
+        instance = self.datasource()
+        self.ready(instance)
+        root = tempfile.gettempdir()
+        before = {
+            name for name in os.listdir(root) if name.startswith("subjective-claude-cli-")
+        }
+        captured: dict = {}
+
+        def fake_popen(argv, *args, **kwargs):
+            captured["prompt"] = argv[-1]
+            staged = {}
+            for name in os.listdir(root):
+                if not name.startswith("subjective-claude-cli-") or name in before:
+                    continue
+                for dirpath, _, filenames in os.walk(os.path.join(root, name)):
+                    for filename in filenames:
+                        path = os.path.join(dirpath, filename)
+                        with open(path, "rb") as handle:
+                            staged[path] = handle.read()
+            captured["files"] = staged
+            return FakePopen(stdout=result_json())
+
+        popen.side_effect = fake_popen
+        result = instance.handle_message({"content": content}, files=files)
+        self.assertIsInstance(result, dict, result)
+        self.assertIn("prompt", captured, result)
+        return result, captured["prompt"], captured["files"]
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
+    def test_dashboard_png_is_written_and_referenced_by_attachment_path(self, popen):
+        raw = b"\x89PNG\r\n\x1a\nfake-image"
+        _result, prompt, staged = self._drive(popen, [
+            self._dashboard_file("pixel.png", "image/png", raw),
+        ])
+        written = [path for path, data in staged.items() if data == raw]
+        self.assertEqual(len(written), 1, staged.keys())
+        path = written[0]
+        self.assertTrue(path.startswith(tempfile.gettempdir()))
+        self.assertIn(f"<attachment_path path={json.dumps(path)}>", prompt)
+        self.assertIn("Read this attached file from the local filesystem.", prompt)
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
+    def test_dashboard_text_is_inlined_not_only_a_path(self, popen):
+        body = "ship the notes"
+        raw = body.encode("utf-8")
+        _result, prompt, staged = self._drive(popen, [
+            self._dashboard_file("notes.txt", "text/plain", raw),
+        ])
+        self.assertIn(f"<attachment name={json.dumps('notes.txt')}>", prompt)
+        self.assertIn(body, prompt)
+        self.assertFalse(
+            any(data == raw for data in staged.values()),
+            "text/plain was only written to a path",
+        )
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
+    def test_dashboard_pdf_is_written_and_referenced_by_attachment_path(self, popen):
+        raw = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n%%EOF"
+        _result, prompt, staged = self._drive(popen, [
+            self._dashboard_file("spec.pdf", "application/pdf", raw),
+        ])
+        written = [path for path, data in staged.items() if data == raw]
+        self.assertEqual(len(written), 1, list(staged))
+        self.assertIn(f"<attachment_path path={json.dumps(written[0])}>", prompt)
+        self.assertIn("Read this attached file from the local filesystem.", prompt)
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
+    def test_an_oversized_file_is_omitted_and_not_written_in_full(self, popen):
+        raw = b"A" * (SubjectiveClaudeCliDataSource.MAX_ATTACHMENT_BYTES + 1)
+        _result, prompt, staged = self._drive(popen, [
+            self._dashboard_file("big.png", "image/png", raw),
+        ])
+        self.assertIn(
+            f"[Attachment omitted: exceeds {SubjectiveClaudeCliDataSource.MAX_ATTACHMENT_BYTES} bytes]",
+            prompt,
+        )
+        self.assertFalse(any(data == raw for data in staged.values()))
+        self.assertFalse(
+            any(len(data) > SubjectiveClaudeCliDataSource.MAX_ATTACHMENT_BYTES for data in staged.values())
+        )
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
+    def test_bad_base64_does_not_raise(self, popen):
+        popen.side_effect = lambda *args, **kwargs: FakePopen(stdout=result_json())
+        instance = self.datasource()
+        self.ready(instance)
+        try:
+            result = instance.handle_message(
+                {"content": "hi"},
+                files=[{"filename": "bad.txt", "mime_type": "text/plain", "content": "****"}],
+            )
+        except Exception as exc:
+            self.fail(f"bad base64 raised {type(exc).__name__}: {exc}")
+        self.assertIsInstance(result, dict)
+
+    @patch("subjective_abstract_data_source_package.command_runner.subprocess.Popen")
     def test_request_can_select_workspace_and_permission_mode(self, run):
         instance = self.datasource(
             working_directory="/tmp", permission_mode="default"
